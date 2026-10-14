@@ -1,0 +1,141 @@
+#include "pc_monitor.h"
+#include <esp_log.h>
+#include <cJSON.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_timer.h>
+#include "board.h"
+
+#define TAG "PcMonitor"
+
+PcMonitor::PcMonitor() : alive_(std::make_shared<std::atomic<bool>>(true)) {}
+
+PcMonitor::~PcMonitor() {
+    if (alive_) {
+        *alive_ = false;
+    }
+    if (reconnect_timer_) {
+        esp_timer_stop(reconnect_timer_);
+        esp_timer_delete(reconnect_timer_);
+    }
+    if (mqtt_) {
+        mqtt_.reset();
+    }
+}
+
+void PcMonitor::Start(const std::string& broker_host, int broker_port,
+                      const std::string& topic,
+                      const std::string& username, const std::string& password) {
+    broker_host_ = broker_host;
+    broker_port_ = broker_port;
+    topic_ = topic;
+    username_ = username;
+    password_ = password;
+
+    esp_timer_create_args_t timer_args = {
+        .callback = [](void* arg) {
+            PcMonitor* self = static_cast<PcMonitor*>(arg);
+            if (self->alive_ && *self->alive_) {
+                self->Reconnect();
+            }
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "pc_monitor_reconnect",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &reconnect_timer_));
+
+    Connect();
+}
+
+bool PcMonitor::Connect() {
+    auto& board = Board::GetInstance();
+    auto network = board.GetNetwork();
+    if (!network) {
+        ESP_LOGE(TAG, "No network interface available");
+        return false;
+    }
+
+    mqtt_ = network->CreateMqtt(0);
+    if (!mqtt_) {
+        ESP_LOGE(TAG, "Failed to create MQTT client");
+        return false;
+    }
+
+    std::string client_id = "pc_monitor_" + board.GetUuid();
+
+    mqtt_->OnMessage([this](const std::string& topic, const std::string& payload) {
+        if (alive_ && *alive_) {
+            OnMqttMessage(topic, payload);
+        }
+    });
+
+    mqtt_->OnConnected([this]() {
+        if (alive_ && *alive_) {
+            OnMqttConnected();
+        }
+    });
+
+    mqtt_->OnDisconnected([this]() {
+        if (alive_ && *alive_) {
+            OnMqttDisconnected();
+        }
+    });
+
+    bool ok = mqtt_->Connect(broker_host_.c_str(), broker_port_, client_id.c_str(),
+                             username_.empty() ? nullptr : username_.c_str(),
+                             password_.empty() ? nullptr : password_.c_str());
+    if (!ok) {
+        ESP_LOGE(TAG, "Failed to connect to MQTT broker %s:%d", broker_host_.c_str(), broker_port_);
+        ScheduleReconnect();
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Connected to MQTT broker %s:%d", broker_host_.c_str(), broker_port_);
+    connected_ = true;
+    return true;
+}
+
+void PcMonitor::Reconnect() {
+    if (connected_) return;
+    ESP_LOGI(TAG, "Reconnecting to MQTT broker...");
+    Connect();
+}
+
+void PcMonitor::ScheduleReconnect() {
+    if (reconnect_timer_ && alive_ && *alive_) {
+        esp_timer_stop(reconnect_timer_);
+        esp_timer_start_once(reconnect_timer_, 10000000);  // 10 seconds
+    }
+}
+
+void PcMonitor::OnMqttConnected() {
+    ESP_LOGI(TAG, "MQTT connected");
+    connected_ = true;
+    if (!topic_.empty()) {
+        mqtt_->Subscribe(topic_.c_str());
+    }
+}
+
+void PcMonitor::OnMqttDisconnected() {
+    ESP_LOGW(TAG, "MQTT disconnected");
+    connected_ = false;
+    ScheduleReconnect();
+}
+
+void PcMonitor::OnMqttMessage(const std::string& topic, const std::string& payload) {
+    if (topic != topic_) return;
+
+    cJSON* root = cJSON_Parse(payload.c_str());
+    if (!root) {
+        ESP_LOGW(TAG, "Failed to parse JSON: %s", payload.c_str());
+        return;
+    }
+
+    last_stats_.reset(cJSON_Duplicate(root, true));
+
+    if (on_stats_) {
+        on_stats_(root);
+    }
+}
